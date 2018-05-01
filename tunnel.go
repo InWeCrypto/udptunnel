@@ -1,16 +1,20 @@
 package udptunnel
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"io"
+	"math"
 	"net"
 	"sync"
 	"time"
 
 	"github.com/dynamicgo/config"
 	"github.com/dynamicgo/slf4go"
+
 	"github.com/inwecrypto/sha3"
 )
 
@@ -21,280 +25,388 @@ const (
 
 // udp tunnel defined errors
 var (
-	ErrPeerTimeout = errors.New("Peer keep-alive timeout")
-	ErrListen      = errors.New("Tunnel already listen or connect")
+	ErrPeerTimeout   = errors.New("Peer keep-alive timeout")
+	ErrListen        = errors.New("Tunnel already listen or connect")
+	ErrMessageLength = errors.New("message length error")
 )
 
-// Peer .
-type Peer interface {
-	// Call peer handler with data
-	Call(path string, data []byte) (int, error)
-
-	Stop()
+// Message .
+type Message struct {
+	ID   [4]byte
+	Body []byte
 }
 
-// Tunnel .
-type Tunnel interface {
-	Listen(addr *net.UDPAddr) error
-	Handle(path string, handler TunnelFunc) Tunnel
-	Peer(raddr *net.UDPAddr) (Peer, error)
-	Context() context.Context
+// id
+var (
+	KeepAliveID = IDFromString(KeepAlive)
+)
+
+// IDFromString .
+func IDFromString(id string) (result [4]byte) {
+	hasher := sha3.NewKeccak256()
+	hasher.Write([]byte(id))
+	data := hasher.Sum(nil)
+
+	copy(result[:], data[0:4])
+
+	return
 }
 
-// TunnelFunc .
-type TunnelFunc func(ctx context.Context, peer Peer, data []byte)
+// IDFromString .
+func (message *Message) IDFromString(id string) {
+	hasher := sha3.NewKeccak256()
+	hasher.Write([]byte(id))
+	data := hasher.Sum(nil)
 
-type tunnelImpl struct {
-	sync.Mutex                          // listen locker
-	slf4go.Logger                       // mixin logger
-	conn          *net.UDPConn          // udp connection
-	handlers      map[string]TunnelFunc // path handlers
-	peers         map[string]Peer       // peer pool
-	ctx           context.Context       // context
-	keepAlive     time.Duration         // keepalive packet send duration
-	recvbuffsize  int                   // max recv buff size
-	handleTimeout time.Duration         // handle process timeout duration
+	copy(message.ID[:], data[0:4])
 }
 
-// New create new server side udp tunnel
-func New(ctx context.Context, conf *config.Config) Tunnel {
-	tunnel := &tunnelImpl{
-		Logger:        slf4go.Get("udptunnel"),
-		handlers:      make(map[string]TunnelFunc),
-		peers:         make(map[string]Peer),
-		ctx:           ctx,
-		keepAlive:     conf.GetDuration("udptunnel.keepalive", 10) * time.Second,
-		recvbuffsize:  int(conf.GetInt64("udptunnel.buffsize", 1000)),
-		handleTimeout: conf.GetDuration("udptunnel.handletimeout", 10) * time.Second,
+// Marshal .
+func (message *Message) Marshal(writer io.Writer) error {
+
+	length := make([]byte, 2)
+
+	body := message.Body
+
+	if len(body)+6 > math.MaxUint16 {
+		body = body[:math.MaxUint16-6]
 	}
 
-	return tunnel.Handle(KeepAlive, tunnel.handleKeepAlive)
-}
-
-func (tunnel *tunnelImpl) handleKeepAlive(ctx context.Context, peer Peer, data []byte) {
-
-}
-
-func (tunnel *tunnelImpl) Context() context.Context {
-	return tunnel.ctx
-}
-
-func (tunnel *tunnelImpl) Listen(addr *net.UDPAddr) error {
-
-	tunnel.Lock()
-	defer tunnel.Unlock()
-
-	return tunnel.listenWitoutLock(addr)
-}
-
-func (tunnel *tunnelImpl) listenWitoutLock(addr *net.UDPAddr) error {
-	if tunnel.conn != nil {
-		return ErrListen
-	}
-
-	conn, err := net.ListenUDP("udp", addr)
+	_, err := writer.Write(message.ID[:])
 
 	if err != nil {
 		return err
 	}
 
-	tunnel.conn = conn
+	binary.BigEndian.PutUint16(length, uint16(len(body)))
 
-	go tunnel.recvLoop()
+	_, err = writer.Write(length)
+
+	if err != nil {
+		return err
+	}
+
+	_, err = writer.Write(body)
+
+	if err != nil {
+		return err
+	}
 
 	return nil
 }
 
-func (tunnel *tunnelImpl) Handle(path string, handler TunnelFunc) Tunnel {
-	tunnel.Lock()
-	defer tunnel.Unlock()
+// Unmarshal .
+func (message *Message) Unmarshal(reader io.Reader) error {
 
-	hasher := sha3.NewKeccak256()
-	hasher.Write([]byte(path))
-	data := hasher.Sum(nil)
+	_, err := reader.Read(message.ID[:])
 
-	tunnel.handlers[hex.EncodeToString(data[0:4])] = handler
+	if err != nil {
+		return err
+	}
+
+	buff := make([]byte, 2)
+
+	_, err = reader.Read(buff)
+
+	if err != nil {
+		return err
+	}
+
+	length := binary.BigEndian.Uint16(buff)
+
+	if length+6 > math.MaxUint16 {
+		return ErrMessageLength
+	}
+
+	return nil
+}
+
+//Tunnel udp tunnel interface
+type Tunnel interface {
+	Remote() *net.UDPAddr
+	Context() context.Context
+	Send(message *Message) error
+	Recv() <-chan *Message
+}
+
+// Server Tunnel server endpoint
+type Server interface {
+	Close()
+	Accept() <-chan Tunnel
+}
+
+type serverImpl struct {
+	*tunnelManager
+	cancel context.CancelFunc
+}
+
+//ListenAndServe create new server
+func ListenAndServe(ctx context.Context, conf *config.Config) (Server, error) {
+
+	laddr, err := net.ResolveUDPAddr("udp", conf.GetString("udptunnel.laddr", ":1812"))
+
+	if err != nil {
+		return nil, err
+	}
+
+	conn, err := net.ListenUDP("udp", laddr)
+
+	if err != nil {
+		return nil, err
+	}
+
+	sctx, cancel := context.WithCancel(ctx)
+
+	tm := newTunnelManager(sctx,
+		conn,
+		conf.GetDuration("udptunnel.heatbeat", 5)*time.Second,
+		int(conf.GetInt64("udptunnel.recv.qsize", 100)),
+		int(conf.GetInt64("udptunnel.recv.buffsize", 1024)),
+		int(conf.GetInt64("udptunnel.notify.qsize", 1024)),
+	)
+
+	return &serverImpl{
+		tunnelManager: tm,
+		cancel:        cancel,
+	}, nil
+}
+
+func (impl *serverImpl) Close() {
+	impl.cancel()
+}
+
+func (impl *serverImpl) Accept() <-chan Tunnel {
+	return impl.notify
+}
+
+// Client tunnel client endpoint
+type Client interface {
+	Close()
+	Connect(raddr string) (Tunnel, error)
+}
+
+type clientImpl struct {
+	*tunnelManager
+	cancel context.CancelFunc
+}
+
+//NewClient .
+func NewClient(ctx context.Context, conf *config.Config) (Client, error) {
+	laddr, err := net.ResolveUDPAddr("udp", ":1812")
+
+	if err != nil {
+		return nil, err
+	}
+
+	laddr.Port = 0
+
+	conn, err := net.ListenUDP("udp", laddr)
+
+	if err != nil {
+		return nil, err
+	}
+
+	sctx, cancel := context.WithCancel(ctx)
+
+	tm := newTunnelManager(sctx,
+		conn,
+		conf.GetDuration("udptunnel.heatbeat", 5)*time.Second,
+		int(conf.GetInt64("udptunnel.recv.qsize", 100)),
+		int(conf.GetInt64("udptunnel.recv.buffsize", 1024)),
+		int(conf.GetInt64("udptunnel.notify.qsize", 1024)),
+	)
+
+	return &clientImpl{
+		tunnelManager: tm,
+		cancel:        cancel,
+	}, nil
+}
+
+func (impl *clientImpl) Close() {
+	impl.cancel()
+}
+
+func (impl *clientImpl) Connect(raddr string) (Tunnel, error) {
+	addr, err := net.ResolveUDPAddr("udp", raddr)
+	if err != nil {
+		return nil, err
+	}
+
+	tunnel, _ := impl.Get(addr)
+
+	return tunnel, nil
+}
+
+type tunnelManager struct {
+	sync.RWMutex
+	slf4go.Logger
+	tunnels      map[string]Tunnel
+	ctx          context.Context
+	conn         *net.UDPConn
+	recvqsize    int
+	recvbuffsize int
+	heatBeat     time.Duration
+	notify       chan Tunnel
+}
+
+func newTunnelManager(
+	ctx context.Context,
+	conn *net.UDPConn,
+	heatBeat time.Duration,
+	recvqsize int,
+	recvbuffsize int,
+	notifyqsize int) *tunnelManager {
+
+	tunnelManager := &tunnelManager{
+		Logger:       slf4go.Get("tunnelmg"),
+		ctx:          ctx,
+		conn:         conn,
+		tunnels:      make(map[string]Tunnel),
+		recvqsize:    recvqsize,
+		heatBeat:     heatBeat,
+		recvbuffsize: recvbuffsize,
+	}
+
+	if notifyqsize >= 0 {
+		tunnelManager.notify = make(chan Tunnel, notifyqsize)
+	}
+
+	go tunnelManager.recvLoop()
+
+	return tunnelManager
+}
+
+func (tm *tunnelManager) recvLoop() {
+	go func() {
+		<-tm.ctx.Done()
+		tm.conn.Close()
+	}()
+
+	for {
+
+		buff := make([]byte, tm.recvbuffsize)
+
+		length, raddr, err := tm.conn.ReadFromUDP(buff)
+
+		if err != nil {
+			tm.ErrorF("recv message :%s", err)
+			return
+		}
+
+		buff = buff[:length]
+
+		message := &Message{}
+
+		if err := message.Unmarshal(bytes.NewBuffer(buff)); err != nil {
+			tm.ErrorF("unmarshal message from %s err :%s", raddr, err)
+			tm.TraceF("invalid message data :%s", hex.EncodeToString(buff))
+			continue
+		}
+
+		if bytes.Equal(message.ID[:], KeepAliveID[:]) {
+			tm.DebugF("recv heatbeat from %s", raddr)
+			continue
+		}
+
+		tunnel, ok := tm.Get(raddr)
+
+		if tm.notify != nil && ok {
+			tm.notify <- tunnel
+		}
+
+		tunnel.(*tunnelImpl).recvq <- message
+	}
+}
+
+func (tm *tunnelManager) Get(raddr *net.UDPAddr) (Tunnel, bool) {
+	tm.RLock()
+	tunnel, ok := tm.tunnels[raddr.String()]
+	tm.RUnlock()
+
+	if !ok {
+		tunnel = tm.makeTunnel(raddr, tm.recvqsize)
+		tm.Lock()
+		tm.tunnels[raddr.String()] = tunnel
+		tm.Unlock()
+	}
+
+	return tunnel, !ok
+}
+
+func (tm *tunnelManager) Del(raddr *net.UDPAddr) {
+	tm.Lock()
+	defer tm.Unlock()
+	delete(tm.tunnels, raddr.String())
+}
+
+type tunnelImpl struct {
+	conn  *net.UDPConn
+	ctx   context.Context
+	raddr *net.UDPAddr
+	recvq chan *Message
+	tm    *tunnelManager
+}
+
+func (tm *tunnelManager) makeTunnel(raddr *net.UDPAddr, recvqszie int) Tunnel {
+
+	tunnel := &tunnelImpl{
+		conn:  tm.conn,
+		ctx:   tm.ctx,
+		raddr: raddr,
+		recvq: make(chan *Message, recvqszie),
+		tm:    tm,
+	}
+
+	go tunnel.heatBeat(tm.heatBeat)
 
 	return tunnel
 }
 
-// Sign get method sign
-func Sign(path string) string {
-	hasher := sha3.NewKeccak256()
-	hasher.Write([]byte(path))
-	data := hasher.Sum(nil)
-
-	return hex.EncodeToString(data[0:4])
-}
-
-func (tunnel *tunnelImpl) Peer(raddr *net.UDPAddr) (Peer, error) {
-	tunnel.Lock()
-	defer tunnel.Unlock()
-
-	if tunnel.conn == nil {
-		if err := tunnel.listenWitoutLock(&net.UDPAddr{IP: net.IPv4zero, Port: 0}); err != nil {
-			return nil, err
-		}
-	}
-
-	peer := tunnel.newPeer(raddr)
-
-	tunnel.peers[raddr.String()] = peer
-
-	go tunnel.recvLoop()
-
-	return peer, nil
-}
-
-func (tunnel *tunnelImpl) recvLoop() {
-	for {
-		select {
-		case <-tunnel.ctx.Done():
-			if err := tunnel.conn.Close(); err != nil {
-				tunnel.ErrorF("close tunnel conn err %s", err)
-			}
-			return
-		default:
-		}
-
-		data := make([]byte, tunnel.recvbuffsize)
-
-		len, raddr, err := tunnel.conn.ReadFromUDP(data)
-
-		if err != nil {
-			tunnel.ErrorF("tunnel recv err %s", err)
-			continue
-		}
-
-		go tunnel.dispatch(data[:len], raddr)
-
-	}
-}
-
-type packetHeader struct {
-	ID     []byte // packet invoke id
-	Length uint16 // packet length
-}
-
-func (tunnel *tunnelImpl) dispatch(data []byte, raddr *net.UDPAddr) {
-
-	if len(data) < 6 {
-		tunnel.ErrorF("recv invalid packet from %s with length %d", raddr, len(data))
-		tunnel.TraceF("recv invalid packet:\n %s", hex.EncodeToString(data))
-		return
-	}
-
-	header := &packetHeader{}
-
-	header.ID = data[:4]
-
-	buff := data[4:6]
-
-	header.Length = binary.BigEndian.Uint16(buff)
-
-	if int(header.Length+6) > len(data) {
-		tunnel.ErrorF("recv invalid packet from %s with header length %d and recv length %d", raddr, header.Length, len(data))
-		tunnel.TraceF("recv invalid packet:\n %s", hex.EncodeToString(data))
-		return
-	}
-
-	data = data[6 : header.Length+6]
-
-	id := hex.EncodeToString(header.ID)
-
-	tunnel.Lock()
-	defer tunnel.Unlock()
-
-	peer, ok := tunnel.peers[raddr.String()]
-
-	if !ok {
-		peer = tunnel.newPeer(raddr)
-		tunnel.peers[raddr.String()] = peer
-	}
-
-	handler, ok := tunnel.handlers[id]
-
-	if !ok {
-		tunnel.TraceF("recv unhandled request %s from %s", id, raddr)
-		return
-	}
-
-	ctx := tunnel.ctx
-	var cancel context.CancelFunc
-
-	if tunnel.handleTimeout != 0 {
-		ctx, cancel = context.WithTimeout(tunnel.ctx, tunnel.handleTimeout)
-	}
-
-	if cancel != nil {
-		cancel = nil
-	}
-
-	go handler(ctx, peer, data)
-}
-
-type peerImpl struct {
-	slf4go.Logger                    // mixin logger
-	conn          *net.UDPConn       // peer conn
-	cancel        context.CancelFunc // cancel func for keepalive goroutine
-	ctx           context.Context
-	addr          *net.UDPAddr
-}
-
-func (tunnel *tunnelImpl) newPeer(addr *net.UDPAddr) Peer {
-	peer := &peerImpl{
-		Logger: slf4go.Get("udptunnel-peer"),
-		conn:   tunnel.conn,
-		addr:   addr,
-	}
-
-	ctx, cancel := context.WithCancel(tunnel.ctx)
-
-	peer.cancel = cancel
-	peer.ctx = ctx
-
-	go peer.keepAlive(ctx, tunnel.keepAlive)
-
-	return peer
-}
-
-func (peer *peerImpl) keepAlive(ctx context.Context, duration time.Duration) {
+func (tunnel *tunnelImpl) heatBeat(duration time.Duration) {
 
 	ticker := time.NewTicker(duration)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-ctx.Done():
+		case <-tunnel.ctx.Done():
+			tunnel.tm.Del(tunnel.raddr)
 			return
 		case <-ticker.C:
-			_, err := peer.Call(KeepAlive, nil)
-
-			if err != nil {
-				peer.ErrorF("send keepalive error %s", err)
-				go peer.Stop()
-			}
+			tunnel.sendHeatBeat()
 		}
 	}
 }
 
-func (peer *peerImpl) Stop() {
-	peer.cancel()
+func (tunnel *tunnelImpl) sendHeatBeat() error {
+	message := &Message{}
+
+	message.IDFromString(KeepAlive)
+
+	return tunnel.Send(message)
 }
 
-func (peer *peerImpl) Call(path string, data []byte) (int, error) {
+func (tunnel *tunnelImpl) Remote() *net.UDPAddr {
+	return tunnel.raddr
+}
 
-	hasher := sha3.NewKeccak256()
-	hasher.Write([]byte(path))
+func (tunnel *tunnelImpl) Context() context.Context {
+	return tunnel.ctx
+}
 
-	id := hasher.Sum(nil)[0:4]
+func (tunnel *tunnelImpl) Send(message *Message) error {
+	var buff bytes.Buffer
+	err := message.Marshal(&buff)
 
-	length := make([]byte, 2)
+	if err != nil {
+		return err
+	}
 
-	binary.BigEndian.PutUint16(length, uint16(len(data)))
+	_, err = tunnel.conn.WriteToUDP(buff.Bytes(), tunnel.raddr)
 
-	buff := append(id, length...)
-	buff = append(buff, data...)
+	return err
+}
 
-	return peer.conn.WriteToUDP(buff, peer.addr)
+func (tunnel *tunnelImpl) Recv() <-chan *Message {
+	return tunnel.recvq
 }

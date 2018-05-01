@@ -2,7 +2,6 @@ package udptunnel
 
 import (
 	"context"
-	"net"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -10,62 +9,54 @@ import (
 	"github.com/dynamicgo/config"
 )
 
-var (
-	server Tunnel
-	client Tunnel
-)
-
-var peer Peer
+var client Client
+var server Server
 
 func init() {
-
 	conf, err := config.New([]byte(`{}`))
 
 	if err != nil {
 		panic(err)
 	}
 
-	server = New(context.Background(), conf)
-
-	server.Handle("/test", func(ctx context.Context, peer Peer, data []byte) {
-
-	})
-
-	err = server.Listen(&net.UDPAddr{IP: net.IPv4zero, Port: 1812})
+	server, err = ListenAndServe(context.Background(), conf)
 
 	if err != nil {
 		panic(err)
 	}
 
-	client = New(context.Background(), conf)
-
-	peer, err = client.Peer(&net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1812})
+	client, err = NewClient(context.Background(), conf)
 
 	if err != nil {
 		panic(err)
 	}
 
+	go func() {
+		for tunnel := range server.Accept() {
+			go func() {
+				for message := range tunnel.Recv() {
+					println("recv message")
+
+					if err := tunnel.Send(message); err != nil {
+						panic(err)
+					}
+				}
+			}()
+		}
+	}()
 }
 
-func TestKeepAliveSign(t *testing.T) {
-	println(Sign("test"))
-}
-
-func TestUpdate(t *testing.T) {
-	_, err := peer.Call("/test", []byte{1, 2})
+func TestSend(t *testing.T) {
+	tunnel, err := client.Connect("127.0.0.1:1812")
 
 	require.NoError(t, err)
-}
 
-func TestTimeout(t *testing.T) {
+	msg := &Message{}
+	msg.IDFromString("test")
 
-	ctx, cancel := context.WithCancel(context.Background())
+	tunnel.Send(msg)
 
-	client.Handle(KeepAlive, func(ctx context.Context, peer Peer, data []byte) {
-		cancel()
-	})
+	msg2 := <-tunnel.Recv()
 
-	<-ctx.Done()
-
-	client.Handle(KeepAlive, func(ctx context.Context, peer Peer, data []byte) {})
+	require.Equal(t, msg, msg2)
 }
